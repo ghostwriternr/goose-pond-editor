@@ -191,6 +191,29 @@ export class Sandbox extends BaseSandbox<Env> {
 
   override async onStop() {
     this.#broadcast("expired");
+
+    // Close all WebSockets so clients are forced through a clean reconnect.
+    // Without this, clients hold a stale WS to a DO whose state is cleared,
+    // causing silent failures when they send messages on it.
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1000, "Container stopped");
+      } catch {}
+    }
+
+    const state = await this.#loadState();
+    if (state) {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.delete(SESSION_STATE_KEY);
+
+      try {
+        const tracker = this.env.SessionTracker.get(
+          this.env.SessionTracker.idFromName("global"),
+        );
+        await tracker.release(state.leaseId);
+      } catch {}
+    }
+
     await super.onStop();
   }
 
@@ -218,14 +241,18 @@ export class Sandbox extends BaseSandbox<Env> {
       },
     });
 
-    if (att.role === "driver" && state.stage === "idle") {
-      const manifest = await this.env.DIFFS.get(
-        `sessions/${state.sessionId}/manifest.json`,
-      );
-      if (manifest) {
-        await this.#restoreSession(manifest);
-      } else {
-        this.#broadcast("prompt");
+    if (att.role === "driver") {
+      if (state.stage === "idle") {
+        const manifest = await this.env.DIFFS.get(
+          `sessions/${state.sessionId}/manifest.json`,
+        );
+        if (manifest) {
+          await this.#restoreSession(manifest);
+        } else {
+          this.#broadcast("prompt");
+        }
+      } else if (state.stage === "done") {
+        this.#send(ws, "prompt");
       }
     }
   }
@@ -275,15 +302,16 @@ export class Sandbox extends BaseSandbox<Env> {
           step: "server",
           message: "Starting dev server…",
         });
-        const server = await this.startProcess("npx vite --host", {
-          cwd: PROJECT_DIR,
-        });
+        const server = await this.#withContainerRetry(() =>
+          this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+        );
         await server.waitForPort(VITE_PORT, { mode: "tcp" });
 
-        const exposed = await this.exposePort(VITE_PORT, {
-          hostname: state.hostname,
-          token: state.sessionId,
-        });
+        const exposed = await this.#ensurePortExposed(
+          VITE_PORT,
+          state.hostname,
+          state.sessionId,
+        );
 
         state = (await this.#loadState())!;
         state.previewUrl = exposed.url;
@@ -298,11 +326,13 @@ export class Sandbox extends BaseSandbox<Env> {
         message: "Agent is reading code…",
       });
 
-      const [appFile, gooseFile, cssFile] = await Promise.all([
-        this.readFile(`${PROJECT_DIR}/src/App.tsx`),
-        this.readFile(`${PROJECT_DIR}/src/PixelGoose.tsx`),
-        this.readFile(`${PROJECT_DIR}/src/index.css`),
-      ]);
+      const [appFile, gooseFile, cssFile] = await this.#withContainerRetry(() =>
+        Promise.all([
+          this.readFile(`${PROJECT_DIR}/src/App.tsx`),
+          this.readFile(`${PROJECT_DIR}/src/PixelGoose.tsx`),
+          this.readFile(`${PROJECT_DIR}/src/index.css`),
+        ]),
+      );
 
       this.#broadcast("status", {
         step: "agent",
@@ -374,7 +404,10 @@ export class Sandbox extends BaseSandbox<Env> {
           `sessions/${state.sessionId}/${fileName}`,
         );
         if (fileObj) {
-          await this.writeFile(filePath, await fileObj.text());
+          const content = await fileObj.text();
+          await this.#withContainerRetry(() =>
+            this.writeFile(filePath, content),
+          );
         }
       }
 
@@ -382,15 +415,16 @@ export class Sandbox extends BaseSandbox<Env> {
         step: "server",
         message: "Starting dev server…",
       });
-      const server = await this.startProcess("npx vite --host", {
-        cwd: PROJECT_DIR,
-      });
+      const server = await this.#withContainerRetry(() =>
+        this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+      );
       await server.waitForPort(VITE_PORT, { mode: "tcp" });
 
-      const exposed = await this.exposePort(VITE_PORT, {
-        hostname: state.hostname,
-        token: state.sessionId,
-      });
+      const exposed = await this.#ensurePortExposed(
+        VITE_PORT,
+        state.hostname,
+        state.sessionId,
+      );
 
       state = (await this.#loadState())!;
       state.previewUrl = exposed.url;
@@ -507,6 +541,40 @@ export class Sandbox extends BaseSandbox<Env> {
       }
     } catch (err) {
       console.error("Failed to persist to R2:", err);
+    }
+  }
+
+  // ── Container helpers ─────────────────────────────────────────────
+
+  async #withContainerRetry<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (i === attempts - 1) throw err;
+        this.#broadcast("status", {
+          step: "server",
+          message: `Waiting for container… (attempt ${i + 2})`,
+        });
+        await new Promise((r) => setTimeout(r, 3000 * 2 ** i));
+      }
+    }
+    throw new Error("unreachable");
+  }
+
+  async #ensurePortExposed(
+    port: number,
+    hostname: string,
+    token: string,
+  ): Promise<{ url: string }> {
+    try {
+      return await this.exposePort(port, { hostname, token });
+    } catch (err) {
+      if (err instanceof Error && err.name === "PortAlreadyExposedError") {
+        await this.unexposePort(port);
+        return await this.exposePort(port, { hostname, token });
+      }
+      throw err;
     }
   }
 
