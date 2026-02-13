@@ -13,7 +13,7 @@
       "class_name": "Sandbox",
       "image": "./Dockerfile",
       "instance_type": "lite",
-      "max_instances": 1,
+      "max_instances": 20,
     },
   ],
   "durable_objects": {
@@ -22,12 +22,22 @@
         "class_name": "Sandbox",
         "name": "Sandbox",
       },
+      {
+        "class_name": "SessionTracker",
+        "name": "SessionTracker",
+      },
     ],
   },
   "migrations": [
     {
-      "new_sqlite_classes": ["Sandbox"],
+      "new_sqlite_classes": ["Sandbox", "SessionTracker"],
       "tag": "v1",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DIFFS",
+      "bucket_name": "goose-pond-diffs",
     },
   ],
   "routes": [

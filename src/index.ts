@@ -1,18 +1,16 @@
-import { getSandbox, proxyToSandbox, type Sandbox } from '@cloudflare/sandbox';
-import { generateText } from 'ai';
-import { createAiGateway } from 'ai-gateway-provider';
-import { createUnified } from 'ai-gateway-provider/providers/unified';
+import { getSandbox, proxyToSandbox } from "@cloudflare/sandbox";
+import { customAlphabet } from "nanoid";
 
-export { Sandbox } from '@cloudflare/sandbox';
+export { Sandbox } from "./sandbox";
+export { SessionTracker } from "./session-tracker";
 
-const REPO_URL = 'https://github.com/ghostwriternr/goose-pond';
-const PROJECT_DIR = '/workspace/goose-pond';
-const VITE_PORT = 5173;
+const generateId = customAlphabet("abcdefghijklmnopqrstuvwxyz0123456789", 8);
+const SESSION_ID_RE = /^[a-z0-9]{8}$/;
 
 const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 function withCors(response: Response): Response {
@@ -25,210 +23,108 @@ function withCors(response: Response): Response {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === 'OPTIONS') {
+    if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // Proxy requests to exposed sandbox ports
-    const proxyResponse = await proxyToSandbox(request, env);
+    const proxyResponse = await proxyToSandbox(
+      request,
+      env as unknown as Parameters<typeof proxyToSandbox>[1],
+    );
     if (proxyResponse) {
-      if (request.headers.get('Upgrade') === 'websocket') {
+      if (request.headers.get("Upgrade") === "websocket") {
         return proxyResponse;
       }
       const response = new Response(proxyResponse.body, proxyResponse);
-      response.headers.delete('X-Frame-Options');
-      response.headers.delete('Content-Security-Policy');
-      response.headers.set('Access-Control-Allow-Origin', '*');
+      response.headers.delete("X-Frame-Options");
+      response.headers.delete("Content-Security-Policy");
+      response.headers.set("Access-Control-Allow-Origin", "*");
       return response;
     }
 
     const url = new URL(request.url);
 
-    if (url.pathname === '/demo') {
-      return handleDemo(request, env);
+    if (
+      url.pathname === "/ws/session" &&
+      request.headers.get("Upgrade")?.toLowerCase() === "websocket"
+    ) {
+      return handleSessionWs(request, env, url);
     }
 
-    // Existing endpoints
-    const sandbox = getSandbox(env.Sandbox, 'my-sandbox');
-
-    if (url.pathname === '/run') {
-      const result = await sandbox.exec('echo "2 + 2 = $((2 + 2))"');
+    if (url.pathname === "/status") {
+      const tracker = env.SessionTracker.get(
+        env.SessionTracker.idFromName("global"),
+      );
+      const active = await tracker.getActive();
       return withCors(
-        Response.json({
-          output: result.stdout,
-          error: result.stderr,
-          exitCode: result.exitCode,
-          success: result.success
-        })
+        new Response(JSON.stringify({ active }), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=1",
+          },
+        }),
       );
     }
 
-    if (url.pathname === '/file') {
-      await sandbox.writeFile('/workspace/hello.txt', 'Hello, Sandbox!');
-      const file = await sandbox.readFile('/workspace/hello.txt');
-      return withCors(Response.json({ content: file.content }));
-    }
-
-    return withCors(new Response('Try /run, /file, or POST /demo'));
-  }
+    return withCors(new Response("Goose Pond Editor API"));
+  },
 };
 
-function sseEvent(event: string, data: Record<string, unknown>): string {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
+async function handleSessionWs(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
+  const tracker = env.SessionTracker.get(
+    env.SessionTracker.idFromName("global"),
+  );
 
-async function handleDemo(request: Request, env: Env): Promise<Response> {
-  if (request.method !== 'POST') {
-    return withCors(
-      new Response('POST { "prompt": "make the goose follow my cursor" }', {
-        status: 405
-      })
+  const existingSessionId = url.searchParams.get("session");
+
+  if (existingSessionId && !SESSION_ID_RE.test(existingSessionId)) {
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.send(
+      JSON.stringify({ type: "error", message: "Invalid session ID format" }),
     );
+    server.close(1008, "Invalid session ID");
+    return new Response(null, { status: 101, webSocket: client });
   }
 
-  const { prompt } = (await request.json()) as { prompt: string };
-  if (!prompt) {
-    return withCors(
-      Response.json({ error: 'prompt is required' }, { status: 400 })
+  const sessionId = existingSessionId || generateId();
+
+  const lease = await tracker.acquire(sessionId);
+  if (!lease) {
+    // Browser WS API doesn't expose HTTP status codes on upgrade failure.
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    const active = await tracker.getActive();
+    server.send(JSON.stringify({ type: "full", active }));
+    server.close(4429, "At capacity");
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  try {
+    const sandbox = getSandbox(env.Sandbox, sessionId);
+
+    const wsUrl = new URL(request.url);
+    wsUrl.searchParams.set("sessionId", sessionId);
+    wsUrl.searchParams.set("leaseId", lease.leaseId);
+    wsUrl.searchParams.set("hostname", request.headers.get("Host") ?? url.host);
+
+    return await sandbox.fetch(new Request(wsUrl, request));
+  } catch (err) {
+    console.error("handleSessionWs error:", err);
+    await tracker.release(sessionId);
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    server.send(
+      JSON.stringify({
+        type: "error",
+        message: `Failed to connect: ${err instanceof Error ? err.message : String(err)}`,
+      }),
     );
+    server.close(1011, "Internal error");
+    return new Response(null, { status: 101, webSocket: client });
   }
-
-  const { host } = new URL(request.url);
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      const send = (event: string, data: Record<string, unknown>) => {
-        controller.enqueue(encoder.encode(sseEvent(event, data)));
-      };
-
-      try {
-        // 1. Provision sandbox
-        send('status', { step: 'sandbox', message: 'Provisioning sandbox…' });
-        const sandboxId = `demo-${Date.now()}`;
-        const sandbox = getSandbox(env.Sandbox, sandboxId);
-
-        // 2. Clone repo
-        send('status', { step: 'clone', message: 'Cloning goose-pond…' });
-        await sandbox.gitCheckout(REPO_URL, { depth: 1 });
-
-        // 3. Install dependencies
-        send('status', {
-          step: 'install',
-          message: 'Installing dependencies…'
-        });
-        const install = await sandbox.exec('npm install', { cwd: PROJECT_DIR });
-        if (!install.success) {
-          send('error', { message: `npm install failed: ${install.stderr}` });
-          controller.close();
-          return;
-        }
-
-        // 4. Start dev server
-        send('status', { step: 'server', message: 'Starting dev server…' });
-        const server = await sandbox.startProcess('npx vite --host', {
-          cwd: PROJECT_DIR
-        });
-
-        // 5. Wait for Vite to be ready
-        await server.waitForPort(VITE_PORT, { mode: 'tcp' });
-
-        // 6. Expose port and emit preview URL
-        const exposed = await sandbox.exposePort(VITE_PORT, { hostname: host });
-        send('status', {
-          step: 'preview',
-          message: 'Preview ready',
-          url: exposed.url
-        });
-
-        // 7. Read source files for LLM context
-        send('status', { step: 'agent', message: 'Agent is reading code…' });
-        const [appFile, gooseFile, cssFile] = await Promise.all([
-          sandbox.readFile(`${PROJECT_DIR}/src/App.tsx`),
-          sandbox.readFile(`${PROJECT_DIR}/src/PixelGoose.tsx`),
-          sandbox.readFile(`${PROJECT_DIR}/src/index.css`)
-        ]);
-
-        // 8. Call LLM to generate modification
-        send('status', { step: 'agent', message: 'Agent is thinking…' });
-
-        const aigateway = createAiGateway({
-          accountId: '8acffcc765d5baa91c873d1459ba1a19',
-          gateway: 'dev-envs-for-agents',
-          apiKey: env.CF_AIG_TOKEN
-        });
-        const unified = createUnified();
-
-        const { text: modifiedCode } = await generateText({
-          model: aigateway(unified('google-ai-studio/gemini-2.5-flash')),
-          prompt: buildLLMPrompt(
-            prompt,
-            appFile.content,
-            gooseFile.content,
-            cssFile.content
-          )
-        });
-
-        // 9. Extract code from LLM response and write it
-        send('status', { step: 'modify', message: 'Applying changes…' });
-        const code = extractCode(modifiedCode);
-        await sandbox.writeFile(`${PROJECT_DIR}/src/App.tsx`, code);
-
-        // 10. Done — Vite HMR picks up the change
-        send('done', { url: exposed.url, message: 'Done!' });
-      } catch (err) {
-        send('error', { message: String(err) });
-      } finally {
-        controller.close();
-      }
-    }
-  });
-
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-      ...CORS_HEADERS
-    }
-  });
-}
-
-function buildLLMPrompt(
-  userPrompt: string,
-  appCode: string,
-  gooseCode: string,
-  cssCode: string
-): string {
-  return `You are modifying a React app. The app renders a pixel art goose on a pond background.
-
-Here are the current source files:
-
-=== src/App.tsx ===
-${appCode}
-
-=== src/PixelGoose.tsx (DO NOT MODIFY — read-only reference) ===
-${gooseCode}
-
-=== src/index.css (DO NOT MODIFY — read-only reference) ===
-${cssCode}
-
-The user wants you to: ${userPrompt}
-
-RULES:
-- ONLY modify App.tsx. Do NOT modify PixelGoose.tsx or index.css.
-- The PixelGoose component accepts these props: size, direction ("left" | "right"), className, style.
-- Return ONLY the complete modified App.tsx file contents.
-- Do NOT include markdown fences, explanations, or anything other than the raw TypeScript/JSX code.
-- The code must be valid TypeScript JSX that compiles without errors.
-- Import React hooks if you use them.`;
-}
-
-function extractCode(response: string): string {
-  // Strip markdown code fences if the model includes them despite instructions
-  const fenceMatch = response.match(/```(?:tsx?|jsx?)?\s*\n([\s\S]*?)```/);
-  if (fenceMatch) {
-    return fenceMatch[1].trim();
-  }
-  return response.trim();
 }
