@@ -1,0 +1,26 @@
+{
+  "name": "goose-pond-editor",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "AI agent demo: modifies a pixel art goose app in a Cloudflare Sandbox",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ai": "^6.0.0",
+    "ai-gateway-provider": "^3.1.1"
+  },
+  "devDependencies": {
+    "@cloudflare/sandbox": "^0.7.2",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.63.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
