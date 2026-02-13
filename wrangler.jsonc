@@ -30,4 +30,14 @@
       "tag": "v1",
     },
   ],
+  "routes": [
+    {
+      "pattern": "goose-pond-editor.ghostwriternr.me",
+      "custom_domain": true,
+    },
+    {
+      "pattern": "*.goose-pond-editor.ghostwriternr.me/*",
+      "zone_name": "ghostwriternr.me",
+    },
+  ],
 }
