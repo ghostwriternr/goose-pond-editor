@@ -14,13 +14,10 @@ const generateSocketId = customAlphabet(
   12,
 );
 
-type SocketRole = "driver" | "viewer";
-
 interface WsAttachment {
   socketId: string;
-  role: SocketRole;
   state: "connected" | "ready";
-  connectedAt: number;
+  replaced?: boolean;
 }
 
 type SessionStage = "idle" | "restoring" | "running" | "done";
@@ -30,12 +27,14 @@ interface SessionState {
   leaseId: string;
   hostname: string;
   stage: SessionStage;
-  driverSocketId?: string;
+  epoch: number;
   previewUrl?: string;
   modifiedFiles: string[];
 }
 
 export class Sandbox extends BaseSandbox<Env> {
+  #stopping = false;
+
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -58,31 +57,36 @@ export class Sandbox extends BaseSandbox<Env> {
           leaseId,
           hostname,
           stage: "idle",
-          driverSocketId: socketId,
+          epoch: 0,
           modifiedFiles: [],
         };
-      } else if (
-        !state.driverSocketId ||
-        !this.#hasSocket(state.driverSocketId)
-      ) {
-        state.driverSocketId = socketId;
       }
 
-      const role: SocketRole =
-        state.driverSocketId === socketId ? "driver" : "viewer";
+      // Accept new socket FIRST
+      this.ctx.acceptWebSocket(server);
 
       const attachment: WsAttachment = {
         socketId,
-        role,
         state: "connected",
-        connectedAt: Date.now(),
       };
-
-      this.ctx.acceptWebSocket(server);
       server.serializeAttachment(attachment);
 
       await this.ctx.storage.put(SESSION_STATE_KEY, state);
       await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+
+      // THEN close old sockets — mark each as replaced before closing
+      for (const existing of this.ctx.getWebSockets()) {
+        if (existing === server) continue;
+        try {
+          const existingAtt =
+            existing.deserializeAttachment() as WsAttachment | null;
+          if (existingAtt) {
+            existingAtt.replaced = true;
+            existing.serializeAttachment(existingAtt);
+          }
+          existing.close(1000, "Replaced by new connection");
+        } catch {}
+      }
 
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -122,40 +126,18 @@ export class Sandbox extends BaseSandbox<Env> {
     }
   }
 
-  async webSocketClose(
-    ws: WebSocket,
-    _code: number,
-    _reason: string,
-    _wasClean: boolean,
-  ): Promise<void> {
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    if (this.#stopping) return;
+
     const att = ws.deserializeAttachment() as WsAttachment | null;
-    if (!att) return;
-
-    const state = await this.#loadState();
-    if (!state) return;
-
-    if (att.socketId === state.driverSocketId) {
-      this.#electNewDriver(state, att.socketId);
-      await this.#saveState(state);
-
-      if (state.driverSocketId) {
-        this.#broadcast("role", { driverSocketId: state.driverSocketId });
-
-        if (state.stage === "idle") {
-          const newDriverWs = this.#findSocket(state.driverSocketId);
-          const newDriverAtt = newDriverWs?.deserializeAttachment() as
-            | WsAttachment
-            | undefined;
-          if (newDriverWs && newDriverAtt?.state === "ready") {
-            this.#send(newDriverWs, "prompt");
-          }
-        }
-      }
-    }
+    if (att?.replaced) return;
 
     const remaining = this.ctx.getWebSockets().filter((s) => s !== ws);
     if (remaining.length === 0) {
-      await this.#finalizeAndDestroy(state);
+      const state = await this.#loadState();
+      if (state) {
+        await this.#finalizeAndDestroy(state);
+      }
     }
   }
 
@@ -190,11 +172,9 @@ export class Sandbox extends BaseSandbox<Env> {
   }
 
   override async onStop() {
+    this.#stopping = true;
     this.#broadcast("expired");
 
-    // Close all WebSockets so clients are forced through a clean reconnect.
-    // Without this, clients hold a stale WS to a DO whose state is cleared,
-    // causing silent failures when they send messages on it.
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.close(1000, "Container stopped");
@@ -228,47 +208,77 @@ export class Sandbox extends BaseSandbox<Env> {
     att.state = "ready";
     ws.serializeAttachment(att);
 
-    const state = await this.#loadState();
+    let state = await this.#loadState();
     if (!state) return;
 
-    this.#send(ws, "welcome", {
-      socketId: att.socketId,
-      role: att.role,
-      session: {
-        sessionId: state.sessionId,
-        stage: state.stage,
-        previewUrl: state.previewUrl,
-      },
-    });
-
-    if (att.role === "driver") {
-      if (state.stage === "idle") {
+    switch (state.stage) {
+      case "idle": {
         const manifest = await this.env.DIFFS.get(
           `sessions/${state.sessionId}/manifest.json`,
         );
-        if (manifest) {
-          await this.#restoreSession(manifest);
-        } else {
-          this.#broadcast("prompt");
+        // Re-check state after R2 await (non-storage I/O allows interleaving)
+        state = await this.#loadState();
+        if (!state) return;
+
+        if (state.stage !== "idle") {
+          this.#send(ws, "welcome", {
+            sessionId: state.sessionId,
+            stage: state.stage,
+            previewUrl: state.previewUrl,
+            epoch: state.epoch,
+          });
+          break;
         }
-      } else if (state.stage === "done") {
-        this.#send(ws, "prompt");
+
+        if (manifest) {
+          const sessionId = state.sessionId;
+          state.stage = "restoring";
+          state.epoch += 1;
+          await this.#saveState(state);
+          this.#send(ws, "welcome", {
+            sessionId: state.sessionId,
+            stage: "restoring",
+            epoch: state.epoch,
+          });
+          await this.#restoreSession(manifest, state.epoch, sessionId);
+        } else {
+          this.#send(ws, "welcome", {
+            sessionId: state.sessionId,
+            stage: "idle",
+            epoch: state.epoch,
+          });
+          this.#send(ws, "ready");
+        }
+        break;
       }
+
+      case "done":
+        this.#send(ws, "welcome", {
+          sessionId: state.sessionId,
+          stage: "done",
+          previewUrl: state.previewUrl,
+          epoch: state.epoch,
+        });
+        this.#send(ws, "ready");
+        break;
+
+      case "restoring":
+      case "running":
+        this.#send(ws, "welcome", {
+          sessionId: state.sessionId,
+          stage: state.stage,
+          previewUrl: state.previewUrl,
+          epoch: state.epoch,
+        });
+        break;
     }
   }
 
   async #handleStart(
     ws: WebSocket,
-    att: WsAttachment,
+    _att: WsAttachment,
     prompt?: string,
   ): Promise<void> {
-    if (att.role !== "driver") {
-      this.#send(ws, "error", {
-        message: "Only the driver can start a generation",
-      });
-      return;
-    }
-
     if (!prompt) {
       this.#send(ws, "error", { message: "prompt is required" });
       return;
@@ -293,17 +303,21 @@ export class Sandbox extends BaseSandbox<Env> {
     let state = await this.#loadState();
     if (!state) return;
 
-    try {
-      state.stage = "running";
-      await this.#saveState(state);
+    state.stage = "running";
+    state.epoch += 1;
+    await this.#saveState(state);
+    const epoch = state.epoch;
 
+    try {
       if (!state.previewUrl) {
         this.#broadcast("status", {
           step: "server",
           message: "Starting dev server…",
+          epoch,
         });
-        const server = await this.#withContainerRetry(() =>
-          this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+        const server = await this.#withContainerRetry(
+          () => this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+          epoch,
         );
         await server.waitForPort(VITE_PORT, { mode: "tcp" });
 
@@ -313,10 +327,11 @@ export class Sandbox extends BaseSandbox<Env> {
           state.sessionId,
         );
 
-        state = (await this.#loadState())!;
+        state = await this.#loadState();
+        if (!state) return;
         state.previewUrl = exposed.url;
         await this.#saveState(state);
-        this.#broadcast("preview", { url: exposed.url });
+        this.#broadcast("preview", { url: exposed.url, epoch });
       }
 
       await this.#renewLease(state.leaseId);
@@ -324,19 +339,23 @@ export class Sandbox extends BaseSandbox<Env> {
       this.#broadcast("status", {
         step: "agent",
         message: "Agent is reading code…",
+        epoch,
       });
 
-      const [appFile, gooseFile, cssFile] = await this.#withContainerRetry(() =>
-        Promise.all([
-          this.readFile(`${PROJECT_DIR}/src/App.tsx`),
-          this.readFile(`${PROJECT_DIR}/src/PixelGoose.tsx`),
-          this.readFile(`${PROJECT_DIR}/src/index.css`),
-        ]),
+      const [appFile, gooseFile, cssFile] = await this.#withContainerRetry(
+        () =>
+          Promise.all([
+            this.readFile(`${PROJECT_DIR}/src/App.tsx`),
+            this.readFile(`${PROJECT_DIR}/src/PixelGoose.tsx`),
+            this.readFile(`${PROJECT_DIR}/src/index.css`),
+          ]),
+        epoch,
       );
 
       this.#broadcast("status", {
         step: "agent",
         message: "Agent is thinking…",
+        epoch,
       });
 
       const aigateway = createAiGateway({
@@ -359,11 +378,13 @@ export class Sandbox extends BaseSandbox<Env> {
       this.#broadcast("status", {
         step: "modify",
         message: "Applying changes…",
+        epoch,
       });
       const code = extractCode(modifiedCode);
       await this.writeFile(`${PROJECT_DIR}/src/App.tsx`, code);
 
-      state = (await this.#loadState())!;
+      state = await this.#loadState();
+      if (!state) return;
       state.modifiedFiles = [`${PROJECT_DIR}/src/App.tsx`];
       state.stage = "done";
       await this.#saveState(state);
@@ -374,26 +395,28 @@ export class Sandbox extends BaseSandbox<Env> {
       this.#broadcast("done", {
         sessionId: state.sessionId,
         url: state.previewUrl,
+        epoch,
       });
     } catch (err) {
-      state = (await this.#loadState())!;
-      state.stage = "done";
+      state = await this.#loadState();
+      if (!state) return;
+      state.stage = "idle";
       await this.#saveState(state);
-      this.#broadcast("error", { message: String(err) });
+      this.#broadcast("error", { message: String(err), epoch });
+      this.#broadcast("ready");
     }
   }
 
-  async #restoreSession(manifestObj: R2ObjectBody): Promise<void> {
-    let state = await this.#loadState();
-    if (!state) return;
-
+  async #restoreSession(
+    manifestObj: R2ObjectBody,
+    epoch: number,
+    sessionId: string,
+  ): Promise<void> {
     try {
-      state.stage = "restoring";
-      await this.#saveState(state);
-
       this.#broadcast("status", {
         step: "restoring",
         message: "Restoring previous session…",
+        epoch,
       });
 
       const manifest = (await manifestObj.json()) as { files: string[] };
@@ -401,24 +424,33 @@ export class Sandbox extends BaseSandbox<Env> {
       for (const filePath of manifest.files) {
         const fileName = filePath.split("/").pop()!;
         const fileObj = await this.env.DIFFS.get(
-          `sessions/${state.sessionId}/${fileName}`,
+          `sessions/${sessionId}/${fileName}`,
         );
-        if (fileObj) {
-          const content = await fileObj.text();
-          await this.#withContainerRetry(() =>
-            this.writeFile(filePath, content),
+        if (!fileObj) {
+          throw new Error(
+            `Missing R2 object: sessions/${sessionId}/${fileName}`,
           );
         }
+        const content = await fileObj.text();
+        await this.#withContainerRetry(
+          () => this.writeFile(filePath, content),
+          epoch,
+        );
       }
 
       this.#broadcast("status", {
         step: "server",
         message: "Starting dev server…",
+        epoch,
       });
-      const server = await this.#withContainerRetry(() =>
-        this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+      const server = await this.#withContainerRetry(
+        () => this.startProcess("npx vite --host", { cwd: PROJECT_DIR }),
+        epoch,
       );
       await server.waitForPort(VITE_PORT, { mode: "tcp" });
+
+      let state = await this.#loadState();
+      if (!state) return;
 
       const exposed = await this.#ensurePortExposed(
         VITE_PORT,
@@ -426,27 +458,32 @@ export class Sandbox extends BaseSandbox<Env> {
         state.sessionId,
       );
 
-      state = (await this.#loadState())!;
+      state = await this.#loadState();
+      if (!state) return;
       state.previewUrl = exposed.url;
       state.modifiedFiles = manifest.files;
       state.stage = "done";
       await this.#saveState(state);
 
-      this.#broadcast("preview", { url: exposed.url });
+      this.#broadcast("preview", { url: exposed.url, epoch });
       await this.#renewLease(state.leaseId);
 
       this.#broadcast("restored", {
         sessionId: state.sessionId,
         url: exposed.url,
+        epoch,
       });
+      this.#broadcast("ready");
     } catch (err) {
-      state = (await this.#loadState())!;
+      const state = await this.#loadState();
+      if (!state) return;
       state.stage = "idle";
       await this.#saveState(state);
       this.#broadcast("error", {
         message: `Restore failed: ${String(err)}`,
+        epoch,
       });
-      this.#broadcast("prompt");
+      this.#broadcast("ready");
     }
   }
 
@@ -458,49 +495,6 @@ export class Sandbox extends BaseSandbox<Env> {
 
   async #saveState(state: SessionState): Promise<void> {
     await this.ctx.storage.put(SESSION_STATE_KEY, state);
-  }
-
-  // ── Multi-tab ─────────────────────────────────────────────────────
-
-  #hasSocket(socketId: string): boolean {
-    for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.socketId === socketId) return true;
-    }
-    return false;
-  }
-
-  #findSocket(socketId: string): WebSocket | undefined {
-    for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (att?.socketId === socketId) return ws;
-    }
-    return undefined;
-  }
-
-  #electNewDriver(state: SessionState, excludeSocketId: string): void {
-    let oldestAtt: WsAttachment | null = null;
-
-    for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as WsAttachment | null;
-      if (!att || att.socketId === excludeSocketId) continue;
-      if (!oldestAtt || att.connectedAt < oldestAtt.connectedAt) {
-        oldestAtt = att;
-      }
-    }
-
-    if (oldestAtt) {
-      state.driverSocketId = oldestAtt.socketId;
-
-      for (const ws of this.ctx.getWebSockets()) {
-        const att = ws.deserializeAttachment() as WsAttachment | null;
-        if (!att || att.socketId === excludeSocketId) continue;
-        att.role = att.socketId === oldestAtt.socketId ? "driver" : "viewer";
-        ws.serializeAttachment(att);
-      }
-    } else {
-      state.driverSocketId = undefined;
-    }
   }
 
   // ── Broadcast / Send ──────────────────────────────────────────────
@@ -546,7 +540,11 @@ export class Sandbox extends BaseSandbox<Env> {
 
   // ── Container helpers ─────────────────────────────────────────────
 
-  async #withContainerRetry<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
+  async #withContainerRetry<T>(
+    fn: () => Promise<T>,
+    epoch?: number,
+    attempts = 5,
+  ): Promise<T> {
     for (let i = 0; i < attempts; i++) {
       try {
         return await fn();
@@ -555,6 +553,7 @@ export class Sandbox extends BaseSandbox<Env> {
         this.#broadcast("status", {
           step: "server",
           message: `Waiting for container… (attempt ${i + 2})`,
+          ...(epoch !== undefined && { epoch }),
         });
         await new Promise((r) => setTimeout(r, 3000 * 2 ** i));
       }
@@ -591,26 +590,24 @@ export class Sandbox extends BaseSandbox<Env> {
     }
   }
 
-  // ── Cleanup ───────────────────────────────────────────────────────
+  // ── Cleanup ──────────────────────────────────────────────────────��
 
   async #finalizeAndDestroy(state: SessionState): Promise<void> {
-    try {
-      await this.#persistToR2(state);
-    } catch {}
+    await this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        await this.#persistToR2(state);
+      } catch {}
 
-    try {
-      const tracker = this.env.SessionTracker.get(
-        this.env.SessionTracker.idFromName("global"),
-      );
-      await tracker.release(state.leaseId);
-    } catch {}
+      try {
+        const tracker = this.env.SessionTracker.get(
+          this.env.SessionTracker.idFromName("global"),
+        );
+        await tracker.release(state.leaseId);
+      } catch {}
 
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.delete(SESSION_STATE_KEY);
-
-    try {
-      await this.destroy();
-    } catch {}
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.delete(SESSION_STATE_KEY);
+    });
   }
 }
 
