@@ -105,7 +105,10 @@ async function handleSessionWs(
   }
 
   try {
-    const sandbox = getSandbox(env.Sandbox, sessionId);
+    const sandbox = getSandbox(env.Sandbox, sessionId, {
+      keepAlive: true,
+      sleepAfter: "20m",
+    });
 
     const wsUrl = new URL(request.url);
     wsUrl.searchParams.set("sessionId", sessionId);
